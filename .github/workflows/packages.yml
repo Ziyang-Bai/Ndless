@@ -113,9 +113,64 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  ndless:
+    name: Ndless / packaged SDK
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download SDK package
+        uses: actions/download-artifact@v8
+        with:
+          name: ndless-sdk-debian-x86_64
+          path: ${{ runner.temp }}/packages
+      - name: Build Ndless
+        run: |
+          mkdir -p "$RUNNER_TEMP/ndless"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -v "$RUNNER_TEMP/packages:/packages:ro" \
+            -v "$RUNNER_TEMP/ndless:/out" \
+            debian:13 sh -c '
+              set -eu
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential php-cli zip /packages/*.deb
+              version=$(dpkg-deb -f /packages/*.deb Version)
+
+              work=$(mktemp -d)
+              trap '\''rm -rf "$work"'\'' EXIT HUP INT TERM
+              cp -a ndless Makefile.include "$work/"
+              # The syscall generator writes headers into the SDK.
+              cp -a "$(nspire-tools path)" "$work/ndless-sdk"
+              export PATH="$work/ndless-sdk/bin:$work/ndless-sdk/toolchain/install/bin:$PATH"
+              make -j"$(nproc)" -C "$work/ndless"
+
+              mkdir -p "$work/dist/persistent"
+              cp README.md Mozilla-Public-License-v1.1.html "$work/dist/"
+              cp "$work"/ndless/calcbin/* "$work/dist/"
+              mv "$work"/dist/persistent_*.tns "$work/dist/persistent/"
+              rm "$work"/dist/downgradefix_3.9*.tns \
+                "$work/dist/ndless_installer_3.9.0_classic.tns"
+              cp -a /usr/share/ndless/samples "$work/dist/"
+              cd "$work/dist"
+              zip -r "/out/ndless-$version.zip" .
+            '
+      - name: Upload Ndless
+        uses: actions/upload-artifact@v7
+        with:
+          name: ndless
+          path: ${{ runner.temp }}/ndless/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
   nightly:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    needs: [ package, macos ]
+    needs: [ package, macos, ndless ]
     runs-on: ubuntu-24.04
     concurrency:
       group: sdk-packages-nightly
@@ -123,10 +178,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download packages
+      - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: ndless-sdk-*
+          pattern: '*'
           path: packages
       - name: Update nightly release
         shell: bash
@@ -142,7 +197,7 @@ jobs:
           fi
 
           mkdir nightly definitions
-          for package in packages/ndless-sdk-*; do
+          for package in packages/*; do
             definitions="definitions/${package##*/}"
             mkdir -p "$definitions"
             for file in "$package"/*; do
@@ -194,7 +249,7 @@ jobs:
           done
 
           {
-            echo "Unstable SDK packages built from $GH_REPO@$GITHUB_SHA."
+            echo "Unstable SDK packages and Ndless built from $GH_REPO@$GITHUB_SHA."
             echo
             echo "This prerelease is updated automatically after successful default-branch builds."
             echo
@@ -220,7 +275,7 @@ jobs:
           old_names="$(jq -r '.[].name' <<< "$assets")"
           while IFS= read -r asset; do
             case "$asset" in
-              ndless-sdk*.deb|ndless-sdk-*.rpm|ndless-sdk-*.apk|ndless-sdk-*@ndless.invalid-*.rsa.pub|ndless-sdk--*.bottle.*|ndless-sdk-*.darwin_*.tbz2|ndless-sdk-osx-*-definitions-*.tar.gz|ndless-sdk.rb|Portfile)
+              ndless-*.zip|ndless-sdk*.deb|ndless-sdk-*.rpm|ndless-sdk-*.apk|ndless-sdk-*@ndless.invalid-*.rsa.pub|ndless-sdk--*.bottle.*|ndless-sdk-*.darwin_*.tbz2|ndless-sdk-osx-*-definitions-*.tar.gz|ndless-sdk.rb|Portfile)
                 if [[ ! -f "nightly/$asset" ]]; then
                   gh release delete-asset nightly "$asset" --yes
                 fi
